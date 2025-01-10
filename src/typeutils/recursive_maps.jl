@@ -1,8 +1,10 @@
 module RecursiveMaps
 
 using EnzymeCore: EnzymeCore, isvectortype, isscalartype
+using EnzymeCore.EnzymeRules: EnzymeRules, VectorSpace
 using ..Compiler: guaranteed_const, guaranteed_const_nongen, guaranteed_nonactive,
     guaranteed_nonactive_nongen
+using LinearAlgebra
 
 ### Config type for setting inactive/nonactive options
 """
@@ -714,6 +716,186 @@ end
     config = make_zero_config(args...; kws...)
     news = recursive_map(seen, _make_zero!!, Val(1), (prev,), config)
     return only(news)::T
+end
+
+### VectorSpace implementation
+## constructors
+@inline EnzymeRules.VectorSpace(val; kws...) = VectorSpace(InactiveConfig(; kws...), val)
+
+@inline function EnzymeRules.VectorSpace(v::VectorSpace{C}, newval::T) where {C, T}
+    return VectorSpace(getconfig(v), newval)::VectorSpace{C, T}
+end
+
+@inline getconfig(v::VectorSpace) = v.config
+
+## comparison
+Base.:(==)(u::VectorSpace{C}, v::VectorSpace{C}) where {C} = (u.val == v.val)
+Base.:(==)(::VectorSpace, ::VectorSpace) = false
+
+Base.isequal(u::VectorSpace{C}, v::VectorSpace{C}) where {C} = isequal(u.val, v.val)
+Base.isequal(::VectorSpace, ::VectorSpace) = false
+
+Base.hash(v::VectorSpace, h::UInt) = hash(v.val, h)
+Base.widen(::Type{VS}) where {VS <: VectorSpace} = VS  # apparently required
+
+## similar
+function Base.similar(v::VectorSpace{C, T}) where {C, T}
+    function similar_or_zero(prev::U) where {U}
+        @assert isvectortype(U)  # otherwise infinite loop
+        new = if isscalartype(U)
+            zero(prev)
+        else
+            similar(prev)
+        end
+        return (convert(U, new)::U,)
+    end
+    newval = first(recursive_map(similar_or_zero, Val(1), (v.val,), getconfig(v)))::T
+    return VectorSpace(v, newval)
+end
+
+## unary arithmetic
+Base.:(+)(v::VS) where {VS <: VectorSpace} = v::VS
+
+function Base.:(-)(v::VectorSpace{C, T}) where {C, T}
+    neg(x) = (oftype(x, -x),)
+    newval = first(recursive_map(neg, Val(1), (v.val,), getconfig(v)))::T
+    return VectorSpace(v, newval)
+end
+
+Base.zero(v::VS) where {VS <: VectorSpace} = VectorSpace(v, EnzymeCore.make_zero(v.val))::VS
+
+## binary arithmetic
+function Base.:(+)(v1::VectorSpace{C, T}, vrest::Vararg{VectorSpace{C}, N}) where {C, T, N}
+    add(x1, xrest...) = (oftype(x1, +(x1, xrest...)),)
+    xs = (v1.val, ntuple(i -> (@inline; vrest[i].val), Val(N))...)
+    newval = first(recursive_map(add, Val(1), xs, getconfig(v1)))::T
+    return VectorSpace(v1, newval)
+end
+
+function Base.:(-)(u::VectorSpace{C, T}, v::VectorSpace{C}) where {C, T}
+    sub(x, y) = (oftype(x, x - y),)
+    newval = first(recursive_map(sub, Val(1), (u.val, v.val), getconfig(u)))::T
+    return VectorSpace(u, newval)
+end
+
+function Base.:(*)(a::Number, v::VectorSpace{C, T}) where {C, T}
+    mul(x) = (oftype(x, a * x),)
+    newval = first(recursive_map(mul, Val(1), (v.val,), getconfig(v)))::T
+    return VectorSpace(v, newval)
+end
+
+@inline Base.:(*)(v::VectorSpace, a::Number) = a * v
+
+function Base.:(/)(v::VectorSpace{C, T}, a::Number) where {C, T}
+    _div(x) = (oftype(x, x / a),)
+    newval = first(recursive_map(_div, Val(1), (v.val,), getconfig(v)))::T
+    return VectorSpace(v, newval)
+end
+
+@inline Base.:(\)(a::Number, v::VectorSpace) = v / a
+
+function LinearAlgebra.lmul!(a::Number, v::VS) where {VS <: VectorSpace}
+    f!!(x) = (oftype(x, a * x),)
+    f!!(x, _x) = (@assert x === _x; LinearAlgebra.lmul!(a, x); (x,))
+    recursive_map!(f!!, (v.val,), (v.val,), getconfig(v))
+    return v::VS
+end
+
+@inline LinearAlgebra.rmul!(v::VectorSpace, a::Number) = LinearAlgebra.lmul!(a, v)
+
+function LinearAlgebra.rdiv!(v::VS, a::Number) where {VS <: VectorSpace}
+    f!!(x) = (oftype(x, x / a),)
+    f!!(x, _x) = (@assert x === _x; LinearAlgebra.rdiv!(x, a); (x,))
+    recursive_map!(f!!, (v.val,), (v.val,), getconfig(v))
+    return v::VS
+end
+
+@inline LinearAlgebra.ldiv!(a::Number, v::VectorSpace) = LinearAlgebra.rdiv!(v, a)
+
+## broadcasting
+struct VSStyle <: Broadcast.BroadcastStyle end
+
+Broadcast.BroadcastStyle(::Type{<:VectorSpace}) = VSStyle()
+Broadcast.BroadcastStyle(s::VSStyle, ::Broadcast.AbstractArrayStyle{0}) = s
+
+Base.similar(bc::Broadcast.Broadcasted{VSStyle}, ::Any) = _similar_to_first_VS(bc.args)
+
+@inline function _similar_to_first_VS(args::Tuple{VS, Vararg{Any}}) where {VS <: VectorSpace}
+    return similar(first(args))::VS
+end
+@inline _similar_to_first_VS(args::Tuple) = _similar_to_first_VS(Base.tail(args))
+@inline _similar_to_first_VS(::Tuple{}) = error("no VectorSpace instance found")
+
+Base.axes(::VectorSpace) = nothing
+Broadcast.broadcastable(vs::VectorSpace) = vs
+Broadcast.instantiate(bc::Broadcast.Broadcasted{VSStyle}) = bc
+
+function Base.copy(bc::Broadcast.Broadcasted{VSStyle})
+    (; f, args) = Broadcast.flatten(bc)
+    return _copy(f, args, getvectors(args))
+end
+
+function Base.copyto!(out::VectorSpace, bc::Broadcast.Broadcasted{VSStyle})
+    (; f, args) = Broadcast.flatten(bc)
+    return _copyto!(f, args, out, getvectors(args))
+end
+
+function _copy(
+        f::A, args, vectors::Tuple{VectorSpace{C, T}, Vararg{VectorSpace{C}, N}}
+    ) where {A, C, T, N}
+    function h(value::U, values::Vararg{Any, N}) where {U}
+        return (broadcast(f, replacevectors(args, (value, values...))...)::U,)
+    end
+    vvalues = ntuple(i -> (@inline; vectors[i].val), Val(N + 1))
+    v1 = first(vectors)
+    newval = first(recursive_map(h, Val(1), vvalues, getconfig(v1)))::T
+    return VectorSpace(v1, newval)
+end
+
+function _copyto!(
+        f::A,
+        args,
+        out::VectorSpace{C, T},
+        vectors::Tuple{Vararg{VectorSpace{C}, M}},
+    ) where {A, C, T, M}
+    function h!!(value::U, values::Vararg{Any, N}) where {U, N}
+        return (broadcast(f, replacevectors(args, (value, values...))...)::U,)
+    end
+    function h!!(outvalue::U, values::Vararg{Any, M}) where {U}
+        broadcast!(f, outvalue, replacevectors(args, values)...)
+        return (outvalue::U,)
+    end
+    vvalues = ntuple(i -> (@inline; vectors[i].val), Val(M))
+    recursive_map!(h!!, (out.val,), vvalues, getconfig(first(vectors)))
+    return out::VectorSpace{C, T}
+end
+
+## broadcast helpers
+@inline function getvectors(args::Tuple{VectorSpace, Vararg{Any}})
+    return (first(args), getvectors(Base.tail(args))...)
+end
+@inline getvectors(args::Tuple{Any, Vararg{Any}}) = getvectors(Base.tail(args))
+@inline getvectors(args::Tuple{VectorSpace}) = args
+@inline getvectors(::Tuple{Any}) = ()
+@inline getvectors(::Tuple{}) = ()
+
+@inline function replacevectors(args::Tuple{Any, Vararg{Any}}, values::Tuple{Any, Vararg{Any}})
+    return (first(args), replacevectors(Base.tail(args), values)...)
+end
+@inline function replacevectors(
+        args::Tuple{VectorSpace, Vararg{Any}}, values::Tuple{Any, Vararg{Any}}
+    )
+    return (first(values), replacevectors(Base.tail(args), Base.tail(values))...)
+end
+@inline function replacevectors(
+        args::Tuple{VectorSpace, Vararg{VectorSpace}}, values::Tuple{Any, Vararg{Any}}
+    )
+    @assert length(args) == length(values)
+    return values
+end
+@inline function replacevectors(args::Tuple{Vararg{Any}}, ::Tuple{})
+    @assert !any(arg -> (@inline; isa(arg, VectorSpace)), args)
+    return args
 end
 
 end  # module RecursiveMaps
