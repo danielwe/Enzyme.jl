@@ -7,6 +7,7 @@ export FwdConfig, FwdConfigWidth
 export AugmentedReturn
 export needs_primal, needs_shadow, width, overwritten, runtime_activity
 export primal_type, shadow_type, tape_type
+export VectorSpace
 
 import Base: unwrapva, isvarargtype, unwrap_unionall, rewrap_unionall
 
@@ -289,5 +290,35 @@ Mark a particular type `Ty` as always being inactive.
 inactive_type(::Type) = false
 
 @inline EnzymeCore.set_runtime_activity(mode::M, config::Config) where {M<:Mode, Config <: Union{FwdConfig, RevConfig}} = EnzymeCore.set_runtime_activity(mode, runtime_activity(config))
+
+"""
+    VectorSpace(val; copy_if_inactive=Val(false), runtime_inactive=Val(false))
+    VectorSpace(v::VectorSpace, newval)
+
+Wrapper implementing vector space operations (vector addition and subtraction,
+multiplication and division by scalars) for the differentiable values within arbitrary
+objects. This includes support for broadcasting such that expressions like
+`x .+ 2 .* y .- z ./ 3` will fuse into a single simultaneous recursion through `x`, `y`, and
+`z`. If all the differentiable values are stored in mutable memory, in-place broadcasting
+like `z .+= x .- 2 .* y` is also supported.
+
+Note that `VectorSpace` only supports broadcasting against other `VectorSpace`s and scalars.
+To accomplish dynamic broadcasting that expands along array dimensions, wrap the
+`VectorSpace` in an indexable object such as an `Array`, `Ref`, or `Tuple`. For example, if
+`x isa VectorSpace`, we have `[2, 3] .* (x,) == [2 .* x, 3 .* x] == [2x, 3x]`.
+
+The arguments `copy_if_inactive` and `runtime_inactive` have the same meaning as in
+[`make_zero`](@ref). In any vector space operation, all `VectorSpace` operands must have the
+same value for these parameters, and the inactive parts of the output are shared or copied
+from the first `VectorSpace` operand.
+
+The updating constructor `VectorSpace(v::VectorSpace, newval)` returns a new `VectorSpace`
+wrapping `newval` but with the same configuration in terms of `copy_if_inactive` and
+`runtime_inactive` as `v`.
+"""
+struct VectorSpace{Config, T}
+    config::Config
+    val::T
+end
 
 end # EnzymeRules
