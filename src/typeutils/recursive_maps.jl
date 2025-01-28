@@ -769,6 +769,29 @@ end
 
 @inline LinearAlgebra.ldiv!(a::Number, v::VectorSpace) = LinearAlgebra.rdiv!(v, a)
 
+## norms and inner products
+# recursive map isn't really designed for this, but it's a pretty benign hack
+# the only issue is we don't know the correctly promoted float type upfront, so to avoid
+# catastrophic performance loss we need to choose a type upfront
+# Is there a better way to do this? Perhaps add a normtype parameter to VectorSpace?
+function LinearAlgebra.norm(v::VectorSpace, p::Real = 2)
+    acc = Float64[]  # XXX: hardcoded output type
+    f!!(x) = (push!(acc, LinearAlgebra.norm(x, p)); x)
+    f!!(x, _x) = (@assert x === _x; f!!(x))
+    val = v.val
+    recursive_map(f!!, val, (val,), getconfig(v))
+    return LinearAlgebra.norm(acc, p)
+end
+
+function LinearAlgebra.dot(u::VectorSpace{C}, v::VectorSpace{C}) where {C}
+    acc = Ref{Float64}(0.0)  # XXX: hardcoded output type
+    f!!(x, y) = (acc[] += LinearAlgebra.dot(x, y); x)
+    f!!(x, _x, y) = (@assert x === _x; f!!(x, y))
+    uval, vval = u.val, v.val
+    recursive_map(f!!, uval, (uval, vval), getconfig(u))
+    return acc[]
+end
+
 ## broadcasting
 struct VSStyle <: Broadcast.BroadcastStyle end
 
