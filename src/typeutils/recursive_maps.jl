@@ -692,6 +692,17 @@ end
 
 @inline getconfig(v::VectorSpace) = v.config
 
+## deepcopy fast path
+function Base.deepcopy(v::VectorSpace{C, T}) where {C, T}
+    # adding a method to deepcopy itself is not the prescribed way to specialize behavior,
+    # but we want to use recursive_map's ability to avoid unnecessary IdDict allocation
+    return VectorSpace(v, recursive_map(copy, (v.val,), getconfig(v))::T)
+end
+
+function Base.deepcopy_internal(v::VectorSpace{C, T}, seen::IdDict) where {C, T}
+    return VectorSpace(v, recursive_map(seen, copy, (v.val,), getconfig(v))::T)
+end
+
 ## comparison
 Base.:(==)(u::VectorSpace{C}, v::VectorSpace{C}) where {C} = (u.val == v.val)
 Base.:(==)(::VectorSpace, ::VectorSpace) = false
